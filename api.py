@@ -14,6 +14,14 @@ from budget_planner import (
     build_system_prompt,
     execute_budget_tool,
 )
+from db import (
+    create_conversation,
+    get_connection,
+    get_conversation_messages,
+    list_user_conversations,
+    save_message,
+    save_messages_batch,
+)
 
 
 app = FastAPI(title="AI Budget Agent API", version="1.0.0")
@@ -60,6 +68,7 @@ class ChatMessage(BaseModel):
 class BudgetChatRequest(BaseModel):
     user_id: int
     messages: list[ChatMessage]
+    conversation_id: int | None = None
 
 
 class BudgetChatResponse(BaseModel):
@@ -67,11 +76,29 @@ class BudgetChatResponse(BaseModel):
     messages: list[dict[str, Any]]
     tool_calls_made: list[str]
     budget_saved: bool
+    conversation_id: int
 
 
 class BudgetStartResponse(BaseModel):
     messages: list[dict[str, Any]]
     reply: str
+    conversation_id: int
+
+
+class ConversationSummary(BaseModel):
+    id: int
+    agent_type: str
+    title: str | None
+    created_at: str
+    updated_at: str
+    message_count: int
+
+
+class ConversationDetail(BaseModel):
+    id: int
+    agent_type: str
+    title: str | None
+    messages: list[dict[str, Any]]
 
 
 def get_client_or_raise():
@@ -286,17 +313,42 @@ def anomaly_check(request: AnomalyCheckRequest) -> AnomalyCheckResponse:
 
 @app.post("/api/agent/budget/chat", response_model=BudgetChatResponse)
 def budget_chat(request: BudgetChatRequest) -> BudgetChatResponse:
-    """多轮预算规划：前端传完整历史，本接口补齐 system 后推进一轮。"""
+    """多轮预算规划：支持 conversation_id 持久化历史，也兼容前端直接传完整历史。"""
     client = get_client_or_raise()
-    messages = [message_to_dict(message) for message in request.messages]
-    messages = ensure_budget_system_message(request.user_id, messages)
+
+    if request.conversation_id is not None:
+        db_messages = get_conversation_messages(request.conversation_id)
+        existing_count = len(db_messages)
+        if len(request.messages) > existing_count:
+            new_msgs = request.messages[existing_count:]
+            messages = db_messages + [message_to_dict(message) for message in new_msgs]
+        elif request.messages and request.messages[-1].role == "user":
+            latest_message = message_to_dict(request.messages[-1])
+            if not db_messages or latest_message.get("content") != db_messages[-1].get("content"):
+                messages = db_messages + [latest_message]
+            else:
+                messages = db_messages
+        else:
+            messages = db_messages
+        conv_id = request.conversation_id
+    else:
+        messages = [message_to_dict(message) for message in request.messages]
+        messages = ensure_budget_system_message(request.user_id, messages)
+        conv_id = create_conversation(
+            request.user_id,
+            "budget_planner",
+            title="预算规划对话",
+        )
 
     reply, tool_calls_made = run_budget_until_text(client, messages)
+    save_messages_batch(conv_id, messages)
+
     return BudgetChatResponse(
         reply=reply,
         messages=messages,
         tool_calls_made=tool_calls_made,
         budget_saved="save_budget_plan" in tool_calls_made,
+        conversation_id=conv_id,
     )
 
 
@@ -306,7 +358,45 @@ def budget_start(user_id: int = Query(..., description="用户 ID")) -> BudgetSt
     client = get_client_or_raise()
     messages = [{"role": "system", "content": build_system_prompt(user_id)}]
     reply, _ = run_budget_until_text(client, messages)
-    return BudgetStartResponse(messages=messages, reply=reply)
+    conv_id = create_conversation(user_id, "budget_planner", title="预算规划对话")
+    save_messages_batch(conv_id, messages)
+    return BudgetStartResponse(messages=messages, reply=reply, conversation_id=conv_id)
+
+
+@app.get("/api/agent/conversations", response_model=list[ConversationSummary])
+def list_conversations(
+    user_id: int = Query(..., description="用户 ID"),
+    agent_type: str | None = Query(None, description="Agent 类型，可选"),
+    limit: int = Query(20, description="最多返回多少条会话"),
+) -> list[ConversationSummary]:
+    """列出某用户的历史会话，按最近更新时间倒序。"""
+    conversations = list_user_conversations(user_id, agent_type, limit)
+    return [ConversationSummary(**conversation) for conversation in conversations]
+
+
+@app.get("/api/agent/conversations/{conversation_id}", response_model=ConversationDetail)
+def get_conversation_detail(conversation_id: int) -> ConversationDetail:
+    """获取某会话的完整消息历史。"""
+    messages = get_conversation_messages(conversation_id)
+    if not messages:
+        raise HTTPException(status_code=404, detail="会话不存在或无消息")
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, agent_type, title FROM conversations WHERE id = %s",
+                (conversation_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="会话不存在")
+
+    return ConversationDetail(
+        id=row[0],
+        agent_type=row[1],
+        title=row[2],
+        messages=messages,
+    )
 
 
 if __name__ == "__main__":

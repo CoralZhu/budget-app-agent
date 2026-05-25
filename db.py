@@ -375,3 +375,262 @@ def get_monthly_income(user_id: int, year_month: str) -> float:
             row = cur.fetchone()
 
     return round(float(row["total_income"]), 2)
+
+
+def _json_dumps_or_none(value):
+    if value is None:
+        return None
+
+    import json
+
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _json_loads_or_none(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, dict)):
+        return value
+
+    import json
+
+    return json.loads(value)
+
+
+def _to_plain_value(value):
+    if value is None:
+        return None
+
+    from datetime import date
+    from decimal import Decimal
+
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return value
+
+
+def create_conversation(user_id: int, agent_type: str, title: str = None) -> int:
+    """
+    创建一条新的 Agent 会话，返回新生成的 conversation_id。
+    """
+    sql = """
+        INSERT INTO conversations (user_id, agent_type, title)
+        VALUES (%s, %s, %s)
+        RETURNING id
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (user_id, agent_type, title or "新对话"))
+            row = cur.fetchone()
+
+    return int(row[0])
+
+
+def save_message(
+    conversation_id,
+    role,
+    content,
+    tool_calls=None,
+    tool_call_id=None,
+    tool_name=None,
+) -> int:
+    """
+    保存单条对话消息，并更新会话的 updated_at。
+    """
+    next_sequence_sql = """
+        SELECT COUNT(*) + 1
+        FROM conversation_messages
+        WHERE conversation_id = %s
+    """
+    insert_sql = """
+        INSERT INTO conversation_messages (
+            conversation_id, role, content, tool_calls, tool_call_id, tool_name, sequence_num
+        )
+        VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)
+        RETURNING id
+    """
+    update_sql = """
+        UPDATE conversations
+        SET updated_at = NOW()
+        WHERE id = %s
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(next_sequence_sql, (conversation_id,))
+            sequence_num = int(cur.fetchone()[0])
+            cur.execute(
+                insert_sql,
+                (
+                    conversation_id,
+                    role,
+                    content,
+                    _json_dumps_or_none(tool_calls),
+                    tool_call_id,
+                    tool_name,
+                    sequence_num,
+                ),
+            )
+            message_id = int(cur.fetchone()[0])
+            cur.execute(update_sql, (conversation_id,))
+
+    return message_id
+
+
+def save_messages_batch(conversation_id, messages: list[dict]) -> int:
+    """
+    批量保存 OpenAI 格式 messages。已存在的 sequence_num 会自动跳过，避免重复保存。
+    """
+    current_sequence_sql = """
+        SELECT COALESCE(MAX(sequence_num), 0)
+        FROM conversation_messages
+        WHERE conversation_id = %s
+    """
+    insert_sql = """
+        INSERT INTO conversation_messages (
+            conversation_id, role, content, tool_calls, tool_call_id, tool_name, sequence_num
+        )
+        VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)
+    """
+    update_sql = """
+        UPDATE conversations
+        SET updated_at = NOW()
+        WHERE id = %s
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(current_sequence_sql, (conversation_id,))
+            current_sequence = int(cur.fetchone()[0])
+            inserted_count = 0
+
+            for sequence_num, message in enumerate(messages, start=1):
+                if sequence_num <= current_sequence:
+                    continue
+
+                cur.execute(
+                    insert_sql,
+                    (
+                        conversation_id,
+                        message.get("role"),
+                        message.get("content"),
+                        _json_dumps_or_none(message.get("tool_calls")),
+                        message.get("tool_call_id"),
+                        message.get("name") or message.get("tool_name"),
+                        sequence_num,
+                    ),
+                )
+                inserted_count += 1
+
+            if inserted_count > 0:
+                cur.execute(update_sql, (conversation_id,))
+
+    return inserted_count
+
+
+def get_conversation_messages(conversation_id: int) -> list[dict]:
+    """
+    读取某个会话的全部消息，按 OpenAI messages 格式返回。
+    """
+    sql = """
+        SELECT role, content, tool_calls::text AS tool_calls, tool_call_id, tool_name
+        FROM conversation_messages
+        WHERE conversation_id = %s
+        ORDER BY sequence_num ASC
+    """
+
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (conversation_id,))
+            rows = cur.fetchall()
+
+    messages = []
+    for row in rows:
+        message = {
+            "role": row["role"],
+            "content": row["content"],
+        }
+
+        tool_calls = _json_loads_or_none(row["tool_calls"])
+        if tool_calls is not None:
+            message["tool_calls"] = tool_calls
+
+        if row["role"] == "tool":
+            message["tool_call_id"] = row["tool_call_id"]
+            message["name"] = row["tool_name"]
+
+        messages.append(message)
+
+    return messages
+
+
+def list_user_conversations(user_id: int, agent_type: str = None, limit: int = 20) -> list[dict]:
+    """
+    列出某用户最近的 Agent 会话，按 updated_at 倒序。
+    """
+    params = [user_id]
+    where_agent_type = ""
+    if agent_type is not None:
+        where_agent_type = "AND c.agent_type = %s"
+        params.append(agent_type)
+    params.append(limit)
+
+    sql = f"""
+        SELECT
+            c.id,
+            c.agent_type,
+            c.title,
+            c.created_at,
+            c.updated_at,
+            COUNT(m.id) AS message_count
+        FROM conversations c
+        LEFT JOIN conversation_messages m ON m.conversation_id = c.id
+        WHERE c.user_id = %s
+          {where_agent_type}
+        GROUP BY c.id, c.agent_type, c.title, c.created_at, c.updated_at
+        ORDER BY c.updated_at DESC
+        LIMIT %s
+    """
+
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+    return [
+        {
+            "id": _to_plain_value(row["id"]),
+            "agent_type": row["agent_type"],
+            "title": row["title"],
+            "created_at": _to_plain_value(row["created_at"]),
+            "updated_at": _to_plain_value(row["updated_at"]),
+            "message_count": int(row["message_count"]),
+        }
+        for row in rows
+    ]
+
+
+if __name__ == "__main__":
+    print("\n" + "=" * 60)
+    print("测试 4: 创建一个新会话并保存消息")
+    print("=" * 60)
+    conv_id = create_conversation(USER_ID, "budget_planner", "测试对话")
+    print(f"  新会话 ID: {conv_id}")
+
+    save_message(conv_id, "system", "你是预算助手")
+    save_message(conv_id, "user", "我想做预算")
+    save_message(conv_id, "assistant", "好的，请问哪个月？")
+    print(f"  插入 3 条消息后，读取出来：")
+    for m in get_conversation_messages(conv_id):
+        print(f"    [{m['role']}] {m.get('content', '')[:30]}")
+
+    print("\n" + "=" * 60)
+    print("测试 5: 列出用户的会话")
+    print("=" * 60)
+    convs = list_user_conversations(USER_ID, "budget_planner")
+    print(f"  找到 {len(convs)} 个 budget_planner 会话")
+    for c in convs[:3]:
+        print(f"    #{c['id']} {c['title']} ({c['message_count']} 条消息)")
