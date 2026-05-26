@@ -28,41 +28,7 @@ Both workflows require tool use and an iterative reasoning loop. The service is 
 
 ## Architecture diagram
 
-```text
-                 ┌─────────────────────────┐
-                 │ Vue Frontend             │
-                 │ http://localhost:5173    │
-                 └────────────┬────────────┘
-                              │ REST / SSE
-                              ▼
-                 ┌─────────────────────────┐
-                 │ Python FastAPI Agent     │
-                 │ http://localhost:8001    │
-                 │ - anomaly agent          │
-                 │ - budget planner agent   │
-                 └───────┬──────────┬──────┘
-                         │          │ OpenAI-compatible API
-                         │          ▼
-                         │   ┌─────────────────────┐
-                         │   │ DeepSeek LLM         │
-                         │   │ deepseek-chat        │
-                         │   └─────────────────────┘
-                         │
-                         │ SQL tools
-                         ▼
-┌────────────────────────────────────────────────────┐
-│ PostgreSQL: ai_budget_app                          │
-│ transactions, budgets, conversations, messages     │
-└────────────────────────────────────────────────────┘
-                         ▲
-                         │ CRUD
-                 ┌───────┴─────────────────┐
-                 │ Spring Boot Backend      │
-                 │ http://localhost:8081    │
-                 │ users, transactions,     │
-                 │ budgets, categories      │
-                 └─────────────────────────┘
-```
+![System Architecture](screenshots/architecture.png)
 
 ## The two agents
 
