@@ -3,6 +3,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from openai import OpenAIError
 from pydantic import BaseModel
 
@@ -129,6 +130,11 @@ def ensure_budget_system_message(
     if messages and messages[0].get("role") == "system":
         return messages
     return [{"role": "system", "content": build_system_prompt(user_id)}] + messages
+
+
+def sse_event(event_type: str, data: dict) -> str:
+    """把数据按 SSE 协议编码为字符串。"""
+    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def execute_anomaly_tool(tool_name: str, arguments_text: str) -> str:
@@ -303,6 +309,99 @@ def run_budget_until_text(
     raise HTTPException(status_code=500, detail="预算规划 Agent 达到最大工具循环次数，已停止。")
 
 
+def stream_budget_react(
+    client: Any,
+    messages: list[dict[str, Any]],
+    max_tool_rounds: int = 10,
+):
+    """
+    流式版预算 ReAct 循环。
+
+    工具决策轮使用非流式调用，便于稳定读取 tool_calls；
+    最终文本回复轮再使用 stream=True，把内容按 SSE text 事件推给前端。
+    """
+    tool_calls_made: list[str] = []
+
+    for round_num in range(1, max_tool_rounds + 1):
+        try:
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=messages,
+                tools=budget_planner.TOOLS,
+            )
+        except OpenAIError as exc:
+            yield sse_event("error", {"message": f"DeepSeek 调用失败: {exc}"})
+            return
+        except Exception as exc:
+            yield sse_event("error", {"message": f"未知异常: {exc}"})
+            return
+
+        assistant_message = response.choices[0].message
+        tool_calls = assistant_message.tool_calls or []
+
+        if tool_calls:
+            append_assistant_with_tool_calls(messages, assistant_message)
+
+            for tool_call in tool_calls:
+                tool_name = tool_call.function.name
+                tool_calls_made.append(tool_name)
+                yield sse_event("tool_call", {"name": tool_name, "round": round_num})
+
+                result_text = execute_budget_tool(
+                    tool_name,
+                    tool_call.function.arguments,
+                    messages,
+                )
+                yield sse_event(
+                    "tool_result",
+                    {"name": tool_name, "summary": result_text[:120]},
+                )
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": tool_name,
+                        "content": result_text,
+                    }
+                )
+            continue
+
+        try:
+            stream = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=messages,
+                tools=budget_planner.TOOLS,
+                stream=True,
+            )
+        except OpenAIError as exc:
+            yield sse_event("error", {"message": f"流式调用失败: {exc}"})
+            return
+        except Exception as exc:
+            yield sse_event("error", {"message": f"流式未知异常: {exc}"})
+            return
+
+        full_text = ""
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            content_piece = getattr(delta, "content", None)
+            if content_piece:
+                full_text += content_piece
+                yield sse_event("text", {"chunk": content_piece})
+
+        messages.append({"role": "assistant", "content": full_text})
+        yield sse_event(
+            "done",
+            {
+                "tool_calls_made": tool_calls_made,
+                "budget_saved": "save_budget_plan" in tool_calls_made,
+            },
+        )
+        return
+
+    yield sse_event("error", {"message": "达到最大工具循环次数"})
+
+
 @app.post("/api/agent/anomaly-check", response_model=AnomalyCheckResponse)
 def anomaly_check(request: AnomalyCheckRequest) -> AnomalyCheckResponse:
     """异常消费检测：执行一轮 ReAct，解析最终 JSON 并返回前端友好结构。"""
@@ -349,6 +448,66 @@ def budget_chat(request: BudgetChatRequest) -> BudgetChatResponse:
         tool_calls_made=tool_calls_made,
         budget_saved="save_budget_plan" in tool_calls_made,
         conversation_id=conv_id,
+    )
+
+
+@app.post("/api/agent/budget/chat/stream")
+def budget_chat_stream(request: BudgetChatRequest):
+    """
+    流式版预算对话。返回 SSE 事件流。
+
+    Request 格式与 /api/agent/budget/chat 一致；支持 conversation_id 从 DB 加载历史，
+    不传 conversation_id 时自动创建新会话。
+    """
+    client = get_client_or_raise()
+
+    if request.conversation_id is not None:
+        db_messages = get_conversation_messages(request.conversation_id)
+        existing_count = len(db_messages)
+        if len(request.messages) > existing_count:
+            new_msgs = request.messages[existing_count:]
+            messages = db_messages + [message_to_dict(message) for message in new_msgs]
+        elif request.messages and request.messages[-1].role == "user":
+            latest_message = message_to_dict(request.messages[-1])
+            if not db_messages or latest_message.get("content") != db_messages[-1].get("content"):
+                messages = db_messages + [latest_message]
+            else:
+                messages = db_messages
+        else:
+            messages = db_messages
+        conv_id = request.conversation_id
+    else:
+        messages = [message_to_dict(message) for message in request.messages]
+        messages = ensure_budget_system_message(request.user_id, messages)
+        conv_id = create_conversation(
+            request.user_id,
+            "budget_planner",
+            title="预算规划对话",
+        )
+
+    def event_generator():
+        yield sse_event("start", {"conversation_id": conv_id})
+
+        for sse_chunk in stream_budget_react(client, messages):
+            yield sse_chunk
+
+        save_messages_batch(conv_id, messages)
+        yield sse_event(
+            "final",
+            {
+                "messages": messages,
+                "conversation_id": conv_id,
+            },
+        )
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
