@@ -4,7 +4,10 @@ A Python FastAPI AI microservice that powers anomaly detection and conversationa
 
 🔗 **Related repos**: [budget-app-frontend](https://github.com/CoralZhu/budget-app-frontend) (Vue) · [budget-app-backend](https://github.com/CoralZhu/budget-app-backend) (Spring Boot)
 
-📹 **Live demo**: Video walkthrough coming soon.
+🌐 **Live API**: [budget-agent-oi5z.onrender.com/docs](https://budget-agent-oi5z.onrender.com/docs) — interactive OpenAPI documentation
+📹 **Demo video**: Coming soon
+
+Note: this service runs on Render's free tier. It may sleep after 15 minutes of inactivity, so the first request can take 30-60 seconds to cold start.
 
 ## Why this exists
 
