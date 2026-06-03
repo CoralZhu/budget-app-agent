@@ -1,7 +1,7 @@
 import json
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openai import OpenAIError
@@ -10,6 +10,7 @@ from pydantic import BaseModel
 import agent as anomaly_agent
 import budget_planner
 from agent import build_client, to_json_text
+from auth import get_current_user_id
 from budget_planner import (
     append_assistant_with_tool_calls,
     build_system_prompt,
@@ -37,7 +38,6 @@ app.add_middleware(
 
 
 class AnomalyCheckRequest(BaseModel):
-    user_id: int
     days: int = 7
 
 
@@ -67,7 +67,6 @@ class ChatMessage(BaseModel):
 
 
 class BudgetChatRequest(BaseModel):
-    user_id: int
     messages: list[ChatMessage]
     conversation_id: int | None = None
 
@@ -130,6 +129,29 @@ def ensure_budget_system_message(
     if messages and messages[0].get("role") == "system":
         return messages
     return [{"role": "system", "content": build_system_prompt(user_id)}] + messages
+
+
+def get_conversation_meta_or_404(conversation_id: int) -> tuple[int, str, str | None]:
+    """读取会话元数据，找不到时返回 404。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id, agent_type, title FROM conversations WHERE id = %s",
+                (conversation_id,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return int(row[0]), row[1], row[2]
+
+
+def ensure_conversation_owner(conversation_id: int, user_id: int) -> tuple[str, str | None]:
+    """确保当前 JWT 用户拥有该会话，防止跨用户读取或追加消息。"""
+    owner_id, agent_type, title = get_conversation_meta_or_404(conversation_id)
+    if owner_id != user_id:
+        raise HTTPException(status_code=403, detail="无权访问该会话")
+    return agent_type, title
 
 
 def sse_event(event_type: str, data: dict) -> str:
@@ -403,19 +425,26 @@ def stream_budget_react(
 
 
 @app.post("/api/agent/anomaly-check", response_model=AnomalyCheckResponse)
-def anomaly_check(request: AnomalyCheckRequest) -> AnomalyCheckResponse:
+def anomaly_check(
+    request: AnomalyCheckRequest,
+    user_id: int = Depends(get_current_user_id),
+) -> AnomalyCheckResponse:
     """异常消费检测：执行一轮 ReAct，解析最终 JSON 并返回前端友好结构。"""
-    raw_response = run_anomaly_react(request.user_id, request.days)
+    raw_response = run_anomaly_react(user_id, request.days)
     data = parse_anomaly_response(raw_response)
     return AnomalyCheckResponse(**data)
 
 
 @app.post("/api/agent/budget/chat", response_model=BudgetChatResponse)
-def budget_chat(request: BudgetChatRequest) -> BudgetChatResponse:
+def budget_chat(
+    request: BudgetChatRequest,
+    user_id: int = Depends(get_current_user_id),
+) -> BudgetChatResponse:
     """多轮预算规划：支持 conversation_id 持久化历史，也兼容前端直接传完整历史。"""
     client = get_client_or_raise()
 
     if request.conversation_id is not None:
+        ensure_conversation_owner(request.conversation_id, user_id)
         db_messages = get_conversation_messages(request.conversation_id)
         existing_count = len(db_messages)
         if len(request.messages) > existing_count:
@@ -432,9 +461,9 @@ def budget_chat(request: BudgetChatRequest) -> BudgetChatResponse:
         conv_id = request.conversation_id
     else:
         messages = [message_to_dict(message) for message in request.messages]
-        messages = ensure_budget_system_message(request.user_id, messages)
+        messages = ensure_budget_system_message(user_id, messages)
         conv_id = create_conversation(
-            request.user_id,
+            user_id,
             "budget_planner",
             title="预算规划对话",
         )
@@ -452,7 +481,10 @@ def budget_chat(request: BudgetChatRequest) -> BudgetChatResponse:
 
 
 @app.post("/api/agent/budget/chat/stream")
-def budget_chat_stream(request: BudgetChatRequest):
+def budget_chat_stream(
+    request: BudgetChatRequest,
+    user_id: int = Depends(get_current_user_id),
+):
     """
     流式版预算对话。返回 SSE 事件流。
 
@@ -462,6 +494,7 @@ def budget_chat_stream(request: BudgetChatRequest):
     client = get_client_or_raise()
 
     if request.conversation_id is not None:
+        ensure_conversation_owner(request.conversation_id, user_id)
         db_messages = get_conversation_messages(request.conversation_id)
         existing_count = len(db_messages)
         if len(request.messages) > existing_count:
@@ -478,9 +511,9 @@ def budget_chat_stream(request: BudgetChatRequest):
         conv_id = request.conversation_id
     else:
         messages = [message_to_dict(message) for message in request.messages]
-        messages = ensure_budget_system_message(request.user_id, messages)
+        messages = ensure_budget_system_message(user_id, messages)
         conv_id = create_conversation(
-            request.user_id,
+            user_id,
             "budget_planner",
             title="预算规划对话",
         )
@@ -512,7 +545,9 @@ def budget_chat_stream(request: BudgetChatRequest):
 
 
 @app.get("/api/agent/budget/start", response_model=BudgetStartResponse)
-def budget_start(user_id: int = Query(..., description="用户 ID")) -> BudgetStartResponse:
+def budget_start(
+    user_id: int = Depends(get_current_user_id),
+) -> BudgetStartResponse:
     """启动预算规划新对话：创建 system message，并让 Agent 主动开场。"""
     client = get_client_or_raise()
     messages = [{"role": "system", "content": build_system_prompt(user_id)}]
@@ -524,7 +559,7 @@ def budget_start(user_id: int = Query(..., description="用户 ID")) -> BudgetSt
 
 @app.get("/api/agent/conversations", response_model=list[ConversationSummary])
 def list_conversations(
-    user_id: int = Query(..., description="用户 ID"),
+    user_id: int = Depends(get_current_user_id),
     agent_type: str | None = Query(None, description="Agent 类型，可选"),
     limit: int = Query(20, description="最多返回多少条会话"),
 ) -> list[ConversationSummary]:
@@ -534,31 +569,28 @@ def list_conversations(
 
 
 @app.get("/api/agent/conversations/{conversation_id}", response_model=ConversationDetail)
-def get_conversation_detail(conversation_id: int) -> ConversationDetail:
+def get_conversation_detail(
+    conversation_id: int,
+    user_id: int = Depends(get_current_user_id),
+) -> ConversationDetail:
     """获取某会话的完整消息历史。"""
     messages = get_conversation_messages(conversation_id)
     if not messages:
         raise HTTPException(status_code=404, detail="会话不存在或无消息")
 
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, agent_type, title FROM conversations WHERE id = %s",
-                (conversation_id,),
-            )
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="会话不存在")
+    agent_type, title = ensure_conversation_owner(conversation_id, user_id)
 
     return ConversationDetail(
-        id=row[0],
-        agent_type=row[1],
-        title=row[2],
+        id=conversation_id,
+        agent_type=agent_type,
+        title=title,
         messages=messages,
     )
 
 
 if __name__ == "__main__":
+    import os
     import uvicorn
 
-    uvicorn.run("api:app", host="0.0.0.0", port=8001, reload=True)
+    port = int(os.getenv("PORT", 8001))
+    uvicorn.run("api:app", host="0.0.0.0", port=port, reload=False)

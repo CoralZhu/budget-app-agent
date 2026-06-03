@@ -16,13 +16,25 @@ load_dotenv()
 
 
 def get_connection():
-    """连接 PostgreSQL 数据库"""
+    """
+    Get a PostgreSQL connection.
+    Priority: DATABASE_URL (Railway-style) > individual DB_* env vars (local dev).
+    """
+    database_url = os.getenv("DATABASE_URL")
+    if database_url:
+        # Railway/Heroku-style URL.
+        # psycopg2 supports postgres:// and postgresql://, but normalize for safety.
+        if database_url.startswith("postgres://"):
+            database_url = database_url.replace("postgres://", "postgresql://", 1)
+        return psycopg2.connect(database_url)
+
+    # Local development: use individual env vars.
     return psycopg2.connect(
-        host=os.getenv("DB_HOST"),
-        port=os.getenv("DB_PORT"),
+        host=os.getenv("DB_HOST", "localhost"),
+        port=os.getenv("DB_PORT", "5432"),
         dbname=os.getenv("DB_NAME"),
         user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD") or "",
+        password=os.getenv("DB_PASSWORD"),
     )
 
 
