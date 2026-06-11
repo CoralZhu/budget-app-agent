@@ -10,6 +10,7 @@ import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timedelta
+from statistics import median
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -118,6 +119,63 @@ def get_category_average(user_id: int, category: str, months: int = 3) -> dict:
         "total_count": count,
         "total_amount": round(total, 2),
         "period_days": period_days,
+    }
+
+
+def get_category_median_baseline(user_id: int, category: str, days: int = 90) -> dict:
+    """
+    查询某用户某分类历史单笔消费中位数（用作异常检测基线）
+
+    Args:
+        user_id: 用户 ID
+        category: 分类名称，如 "餐饮"、"购物"、"交通"
+        days: 统计最近多少天，异常检测默认 90 天
+
+    Returns:
+        包含 median_amount（单笔中位数）、threshold（2.5 倍阈值）和样本量信息
+    """
+    sql = """
+        SELECT amount
+        FROM transactions
+        WHERE user_id = %s
+          AND category = %s
+          AND type = 'expense'
+          AND spent_at >= %s
+        ORDER BY spent_at DESC
+    """
+    since = datetime.now() - timedelta(days=days)
+
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (user_id, category, since))
+            rows = cur.fetchall()
+
+    amounts = [float(r["amount"]) for r in rows]
+    count = len(amounts)
+    has_enough_data = count >= 5
+
+    if not has_enough_data:
+        return {
+            "category": category,
+            "median_amount": 0,
+            "threshold": 0,
+            "transaction_count": count,
+            "baseline_days": days,
+            "min_transactions_required": 5,
+            "has_enough_data": False,
+        }
+
+    median_amount = float(median(amounts))
+    threshold = median_amount * 2.5
+
+    return {
+        "category": category,
+        "median_amount": round(median_amount, 2),
+        "threshold": round(threshold, 2),
+        "transaction_count": count,
+        "baseline_days": days,
+        "min_transactions_required": 5,
+        "has_enough_data": True,
     }
 
 

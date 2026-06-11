@@ -4,7 +4,18 @@ A Python FastAPI AI microservice that powers anomaly detection and conversationa
 
 🔗 **Related repos**: [budget-app-frontend](https://github.com/CoralZhu/budget-app-frontend) (Vue) · [budget-app-backend](https://github.com/CoralZhu/budget-app-backend) (Spring Boot)
 
-🚀 **Live demo**: [budget-app-frontend-7x7q.onrender.com](https://budget-app-frontend-7x7q.onrender.com) — public demo with auto-injected guest token (AI features work; transactions CRUD requires Spring Boot backend, currently in roadmap)
+🚀 **Live demo**: [budget-app-frontend-7x7q.onrender.com](https://budget-app-frontend-7x7q.onrender.com) — fully functional public demo. Two entry options:
+   - **Quick demo**: instantly access a shared demo account
+   - **Sign up**: create your own account (no email verification needed in preview mode)
+
+**Features available in live demo**:
+- 🤖 AI anomaly detection (background agent, surfaces unusual spending)
+- 💬 AI budget planning chat (streaming, multi-turn, ReAct loop)
+- 📷 OCR receipt recognition (Aliyun OCR + DeepSeek extraction)
+- 🎤 Voice input (Web Speech API + LLM parsing)
+- 📊 Transaction CRUD with category management
+- 📈 Budget management (total + per-category)
+- 📁 Import from Alipay CSV / WeChat XLSX
 
 📖 **API docs**: [budget-agent-oi5z.onrender.com/docs](https://budget-agent-oi5z.onrender.com/docs) — OpenAPI Swagger UI
 
@@ -207,7 +218,7 @@ The budget write guardrail is implemented twice because prompts are not enforcem
 ## What's next
 
 - JWT authentication; currently `user_id` is passed in request bodies or query parameters.
-- Cloud deployment for the FastAPI service and PostgreSQL connection management.
+- Production hardening for the FastAPI service and PostgreSQL connection management.
 - Streaming support for anomaly detection if the product needs progress indicators.
 - More agents, such as monthly recap generation and OCR result categorization.
 - Long-term memory beyond raw conversation history.

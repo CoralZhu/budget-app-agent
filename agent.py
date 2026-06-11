@@ -5,15 +5,17 @@ from typing import Any
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
 
-from db import get_all_categories, get_category_average, get_recent_transactions
+from db import get_all_categories, get_category_median_baseline, get_recent_transactions
 
 
 SYSTEM_PROMPT = """你是一个消费异常检测助手。当用户询问异常消费时，你必须按以下步骤工作：
 1. 先调用 get_recent_transactions 查最近 7 天的交易
-2. 对于每个出现的分类，调用 get_category_average 查该分类的历史日均
-3. 判断标准：单笔消费金额 > 该分类日均的 2 倍，视为异常
-4. 用中文输出异常清单，说明每笔异常的金额、商家、超出基线多少
-5. 如果没有异常，明确告诉用户'最近 7 天消费正常'
+2. 对于每个出现的分类，调用 get_category_median_baseline 查该分类最近 90 天历史单笔消费中位数
+3. 如果该分类历史交易少于 5 笔，跳过该分类，不要标记异常
+4. 判断标准：单笔消费金额 > 历史单笔中位数的 2.5 倍，视为异常
+5. 异常原因使用格式：单笔{分类}消费{金额}元，超出历史单笔中位数{中位数}元的2.5倍基线({阈值}元)
+6. 用中文输出异常清单，说明每笔异常的金额、商家、超出基线多少
+7. 如果没有异常，明确告诉用户'最近 7 天消费正常'
 不要凭空猜测，所有判断必须基于工具返回的真实数据。"""
 
 
@@ -48,9 +50,9 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_category_average",
+            "name": "get_category_median_baseline",
             "description": (
-                "查询某个用户某个消费分类的历史日均消费，用作异常检测基线。"
+                "查询某个用户某个消费分类最近 90 天的历史单笔消费中位数，用作异常检测基线。"
                 "拿到最近 7 天交易后，应对每个出现过的分类调用本工具。"
             ),
             "parameters": {
@@ -64,12 +66,12 @@ TOOLS = [
                         "type": "string",
                         "description": "消费分类名称，例如：餐饮、购物、交通、娱乐。",
                     },
-                    "months": {
+                    "days": {
                         "type": "integer",
-                        "description": "统计最近多少个月的历史数据；默认使用 3 个月。",
+                        "description": "统计最近多少天的历史数据；异常检测固定传 90。",
                     },
                 },
-                "required": ["user_id", "category", "months"],
+                "required": ["user_id", "category", "days"],
                 "additionalProperties": False,
             },
         },
@@ -100,7 +102,7 @@ TOOLS = [
 
 TOOL_FUNCTIONS = {
     "get_recent_transactions": get_recent_transactions,
-    "get_category_average": get_category_average,
+    "get_category_median_baseline": get_category_median_baseline,
     "get_all_categories": get_all_categories,
 }
 
